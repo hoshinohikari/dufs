@@ -147,11 +147,11 @@ impl Server {
     pub async fn handle(self: Arc<Self>, req: Request) -> Result<Response> {
         let mut res = Response::default();
 
-        let req_path = req.uri().path();
+        let req_path = req.uri().path().to_string();
         let headers = req.headers();
         let method = req.method().clone();
 
-        let relative_path = match self.resolve_path(req_path) {
+        let relative_path = match self.resolve_path(&req_path) {
             Some(v) => v,
             None => {
                 status_bad_request(&mut res, "Invalid Path");
@@ -242,7 +242,7 @@ impl Server {
             if self
                 .single_file_req_paths
                 .iter()
-                .any(|v| v.as_str() == req_path)
+                .any(|v| v.as_str() == req_path.as_str())
             {
                 self.handle_send_file(&self.args.serve_path, headers, head_only, &mut res)
                     .await?;
@@ -453,7 +453,8 @@ impl Server {
                 }
                 "PROPPATCH" => {
                     if is_file {
-                        self.handle_proppatch(req_path, path, req, &mut res).await?;
+                        self.handle_proppatch(&req_path, path, req, &mut res)
+                            .await?;
                     } else {
                         status_not_found(&mut res);
                     }
@@ -490,7 +491,7 @@ impl Server {
                     // Fake lock
                     if is_file {
                         let has_auth = authorization.is_some();
-                        self.handle_lock(req_path, has_auth, &mut res).await?;
+                        self.handle_lock(&req_path, has_auth, &mut res).await?;
                     } else {
                         status_not_found(&mut res);
                     }
@@ -1962,6 +1963,7 @@ struct ProppatchTimeProperties {
 }
 
 impl ProppatchTimeProperties {
+    #[cfg(not(windows))]
     fn has_valid_mtime_update(&self) -> bool {
         matches!(self.modified, ParsedProppatchTime::Valid(_))
             || matches!(self.win32_modified, ParsedProppatchTime::Valid(_))
