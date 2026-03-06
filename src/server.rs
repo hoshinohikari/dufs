@@ -14,6 +14,7 @@ use async_zip::{tokio::write::ZipFileWriter, Compression, ZipDateTime, ZipEntryB
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use bytes::Bytes;
 use chrono::{LocalResult, TimeZone, Utc};
+use filetime::FileTime;
 use futures_util::{pin_mut, TryStreamExt};
 use headers::{
     AcceptRanges, AccessControlAllowCredentials, AccessControlAllowOrigin, CacheControl,
@@ -51,6 +52,7 @@ use tokio_util::io::{ReaderStream, StreamReader};
 use uuid::Uuid;
 use walkdir::{DirEntry, WalkDir};
 use xml::escape::escape_str_pcdata;
+use xml::reader::{EventReader, XmlEvent};
 
 pub type Request = hyper::Request<Incoming>;
 pub type Response = hyper::Response<BoxBody<Bytes, anyhow::Error>>;
@@ -451,7 +453,7 @@ impl Server {
                 }
                 "PROPPATCH" => {
                     if is_file {
-                        self.handle_proppatch(req_path, &mut res).await?;
+                        self.handle_proppatch(req_path, path, req, &mut res).await?;
                     } else {
                         status_not_found(&mut res);
                     }
@@ -1170,9 +1172,61 @@ impl Server {
         Ok(())
     }
 
-    async fn handle_proppatch(&self, req_path: &str, res: &mut Response) -> Result<()> {
-        let output = format!(
-            r#"<D:response>
+    async fn handle_proppatch(
+        &self,
+        req_path: &str,
+        path: &Path,
+        req: Request,
+        res: &mut Response,
+    ) -> Result<()> {
+        let body = req.into_body().collect().await?.to_bytes();
+        let body = match std::str::from_utf8(&body) {
+            Ok(v) => v,
+            Err(_) => {
+                status_bad_request(res, "Invalid PROPPATCH body");
+                return Ok(());
+            }
+        };
+        let parsed = match parse_proppatch_time_properties(body) {
+            Ok(v) => v,
+            Err(_) => {
+                status_bad_request(res, "Invalid PROPPATCH body");
+                return Ok(());
+            }
+        };
+        #[cfg(not(windows))]
+        let ignore_creation_error = parsed.has_valid_mtime_update();
+        #[cfg(windows)]
+        let ignore_creation_error = false;
+        let mut propstats: Vec<(&str, &'static str)> = Vec::new();
+        for prop in ProppatchProperty::all() {
+            let value = match parsed.get(prop) {
+                ParsedProppatchTime::NotPresent => continue,
+                ParsedProppatchTime::Invalid => {
+                    propstats.push((prop.response_xml(), "HTTP/1.1 400 Bad Request"));
+                    continue;
+                }
+                ParsedProppatchTime::Valid(v) => *v,
+            };
+            let status = if prop.is_creation_time() {
+                if set_creation_time(path, value).is_ok() {
+                    "HTTP/1.1 200 OK"
+                } else if ignore_creation_error {
+                    // On non-Windows systems, skip creation time updates when mtime is also requested.
+                    "HTTP/1.1 200 OK"
+                } else {
+                    "HTTP/1.1 403 Forbidden"
+                }
+            } else if filetime::set_file_mtime(path, FileTime::from_system_time(value)).is_ok() {
+                "HTTP/1.1 200 OK"
+            } else {
+                "HTTP/1.1 403 Forbidden"
+            };
+            propstats.push((prop.response_xml(), status));
+        }
+        if propstats.is_empty() {
+            let output = format!(
+                r#"<D:response>
 <D:href>{req_path}</D:href>
 <D:propstat>
 <D:prop>
@@ -1180,7 +1234,27 @@ impl Server {
 <D:status>HTTP/1.1 403 Forbidden</D:status>
 </D:propstat>
 </D:response>"#
+            );
+            res_multistatus(res, &output);
+            return Ok(());
+        }
+        let mut output = format!(
+            r#"<D:response>
+<D:href>{req_path}</D:href>
+"#
         );
+        for (prop, status) in propstats {
+            output.push_str(&format!(
+                r#"<D:propstat>
+<D:prop>
+{prop}
+</D:prop>
+<D:status>{status}</D:status>
+</D:propstat>
+"#
+            ));
+        }
+        output.push_str("</D:response>");
         res_multistatus(res, &output);
         Ok(())
     }
@@ -1813,11 +1887,204 @@ fn set_webdav_headers(res: &mut Response) {
     res.headers_mut().insert(
         "Allow",
         HeaderValue::from_static(
-            "GET,HEAD,PUT,OPTIONS,DELETE,PATCH,PROPFIND,COPY,MOVE,CHECKAUTH,LOGOUT",
+            "GET,HEAD,PUT,OPTIONS,DELETE,PATCH,PROPFIND,PROPPATCH,COPY,MOVE,CHECKAUTH,LOGOUT",
         ),
     );
     res.headers_mut()
         .insert("DAV", HeaderValue::from_static("1, 2, 3"));
+}
+
+#[derive(Clone, Copy)]
+enum ParsedProppatchTime {
+    NotPresent,
+    Invalid,
+    Valid(SystemTime),
+}
+
+impl Default for ParsedProppatchTime {
+    fn default() -> Self {
+        Self::NotPresent
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ProppatchProperty {
+    CreationDate,
+    LastModified,
+    Win32CreationTime,
+    Win32LastModifiedTime,
+}
+
+impl ProppatchProperty {
+    fn all() -> [Self; 4] {
+        [
+            Self::CreationDate,
+            Self::LastModified,
+            Self::Win32CreationTime,
+            Self::Win32LastModifiedTime,
+        ]
+    }
+
+    fn from_local_name(name: &str) -> Option<Self> {
+        match name {
+            "creationdate" => Some(Self::CreationDate),
+            "getlastmodified" => Some(Self::LastModified),
+            "Win32CreationTime" => Some(Self::Win32CreationTime),
+            "Win32LastModifiedTime" => Some(Self::Win32LastModifiedTime),
+            _ => None,
+        }
+    }
+
+    fn response_xml(&self) -> &'static str {
+        match self {
+            Self::CreationDate => "<D:creationdate/>",
+            Self::LastModified => "<D:getlastmodified/>",
+            Self::Win32CreationTime => {
+                r#"<Z:Win32CreationTime xmlns:Z="urn:schemas-microsoft-com:"/>"#
+            }
+            Self::Win32LastModifiedTime => {
+                r#"<Z:Win32LastModifiedTime xmlns:Z="urn:schemas-microsoft-com:"/>"#
+            }
+        }
+    }
+
+    fn is_creation_time(&self) -> bool {
+        matches!(self, Self::CreationDate | Self::Win32CreationTime)
+    }
+}
+
+#[derive(Default)]
+struct ProppatchTimeProperties {
+    creation: ParsedProppatchTime,
+    modified: ParsedProppatchTime,
+    win32_creation: ParsedProppatchTime,
+    win32_modified: ParsedProppatchTime,
+}
+
+impl ProppatchTimeProperties {
+    fn has_valid_mtime_update(&self) -> bool {
+        matches!(self.modified, ParsedProppatchTime::Valid(_))
+            || matches!(self.win32_modified, ParsedProppatchTime::Valid(_))
+    }
+
+    fn mark_present(&mut self, prop: ProppatchProperty) {
+        let target = self.get_mut(prop);
+        if matches!(target, ParsedProppatchTime::NotPresent) {
+            *target = ParsedProppatchTime::Invalid;
+        }
+    }
+
+    fn set_time(&mut self, prop: ProppatchProperty, value: SystemTime) {
+        *self.get_mut(prop) = ParsedProppatchTime::Valid(value);
+    }
+
+    fn get(&self, prop: ProppatchProperty) -> &ParsedProppatchTime {
+        match prop {
+            ProppatchProperty::CreationDate => &self.creation,
+            ProppatchProperty::LastModified => &self.modified,
+            ProppatchProperty::Win32CreationTime => &self.win32_creation,
+            ProppatchProperty::Win32LastModifiedTime => &self.win32_modified,
+        }
+    }
+
+    fn get_mut(&mut self, prop: ProppatchProperty) -> &mut ParsedProppatchTime {
+        match prop {
+            ProppatchProperty::CreationDate => &mut self.creation,
+            ProppatchProperty::LastModified => &mut self.modified,
+            ProppatchProperty::Win32CreationTime => &mut self.win32_creation,
+            ProppatchProperty::Win32LastModifiedTime => &mut self.win32_modified,
+        }
+    }
+}
+
+fn parse_proppatch_time_properties(input: &str) -> Result<ProppatchTimeProperties> {
+    let mut parsed = ProppatchTimeProperties::default();
+    let mut current: Option<(ProppatchProperty, String)> = None;
+    for event in EventReader::new(input.as_bytes()) {
+        match event? {
+            XmlEvent::StartElement { name, .. } => {
+                if let Some(prop) = ProppatchProperty::from_local_name(&name.local_name) {
+                    parsed.mark_present(prop);
+                    current = Some((prop, String::new()));
+                }
+            }
+            XmlEvent::Characters(value) | XmlEvent::CData(value) => {
+                if let Some((_, text)) = current.as_mut() {
+                    text.push_str(&value);
+                }
+            }
+            XmlEvent::EndElement { name } => {
+                if let Some((prop, value)) = current.take() {
+                    if name.local_name == prop_name(prop) {
+                        if let Some(time) = parse_webdav_time(value.trim()) {
+                            parsed.set_time(prop, time);
+                        }
+                    } else {
+                        current = Some((prop, value));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(parsed)
+}
+
+fn prop_name(prop: ProppatchProperty) -> &'static str {
+    match prop {
+        ProppatchProperty::CreationDate => "creationdate",
+        ProppatchProperty::LastModified => "getlastmodified",
+        ProppatchProperty::Win32CreationTime => "Win32CreationTime",
+        ProppatchProperty::Win32LastModifiedTime => "Win32LastModifiedTime",
+    }
+}
+
+fn parse_webdav_time(value: &str) -> Option<SystemTime> {
+    if value.is_empty() {
+        return None;
+    }
+    if let Ok(v) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Some(v.with_timezone(&Utc).into());
+    }
+    if let Ok(v) = chrono::DateTime::parse_from_rfc2822(value) {
+        return Some(v.with_timezone(&Utc).into());
+    }
+    None
+}
+
+#[cfg(windows)]
+fn set_creation_time(path: &Path, time: SystemTime) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::Storage::FileSystem::SetFileTime;
+
+    let file = std::fs::OpenOptions::new().write(true).open(path)?;
+    let duration = time.duration_since(SystemTime::UNIX_EPOCH)?;
+    let ticks =
+        (duration.as_secs() + 11_644_473_600) * 10_000_000 + (duration.subsec_nanos() as u64 / 100);
+    let filetime = FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    let ok = unsafe {
+        SetFileTime(
+            file.as_raw_handle() as _,
+            &filetime,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn set_creation_time(_path: &Path, _time: SystemTime) -> Result<()> {
+    Err(anyhow!(
+        "Setting file creation time is not supported on this platform"
+    ))
 }
 
 async fn get_content_type(path: &Path) -> Result<String> {

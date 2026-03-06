@@ -3,6 +3,8 @@ mod utils;
 
 use fixtures::{server, Error, TestServer, FILES};
 use rstest::rstest;
+use std::fs;
+use std::time::SystemTime;
 use xml::escape::escape_str_pcdata;
 
 #[rstest]
@@ -87,6 +89,120 @@ fn proppatch_file(#[with(&["-A"])] server: TestServer) -> Result<(), Error> {
     assert_eq!(resp.status(), 207);
     let body = resp.text()?;
     assert!(body.contains("<D:href>/test.html</D:href>"));
+    Ok(())
+}
+
+#[rstest]
+fn proppatch_file_set_mtime(#[with(&["-A"])] server: TestServer) -> Result<(), Error> {
+    let ts = "Fri, 06 Mar 2026 01:02:03 GMT";
+    let body = format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<D:propertyupdate xmlns:D="DAV:">
+<D:set><D:prop><D:getlastmodified>{ts}</D:getlastmodified></D:prop></D:set>
+</D:propertyupdate>"#
+    );
+    let resp = fetch!(b"PROPPATCH", format!("{}test.html", server.url()))
+        .header("content-type", "application/xml; charset=utf-8")
+        .body(body)
+        .send()?;
+    assert_eq!(resp.status(), 207);
+    let body = resp.text()?;
+    assert!(body.contains("<D:getlastmodified/>"));
+    assert!(body.contains("<D:status>HTTP/1.1 200 OK</D:status>"));
+    let expected = chrono::DateTime::parse_from_rfc2822(ts)?
+        .with_timezone(&chrono::Utc)
+        .timestamp() as u64;
+    let actual = fs::metadata(server.path().join("test.html"))?
+        .modified()?
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_secs();
+    assert_eq!(actual, expected);
+    Ok(())
+}
+
+#[cfg(windows)]
+#[rstest]
+fn proppatch_file_set_creationdate(#[with(&["-A"])] server: TestServer) -> Result<(), Error> {
+    let ts = "2026-03-06T01:02:03Z";
+    let body = format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<D:propertyupdate xmlns:D="DAV:">
+<D:set><D:prop><D:creationdate>{ts}</D:creationdate></D:prop></D:set>
+</D:propertyupdate>"#
+    );
+    let resp = fetch!(b"PROPPATCH", format!("{}test.html", server.url()))
+        .header("content-type", "application/xml; charset=utf-8")
+        .body(body)
+        .send()?;
+    assert_eq!(resp.status(), 207);
+    let body = resp.text()?;
+    assert!(body.contains("<D:creationdate/>"));
+    assert!(body.contains("<D:status>HTTP/1.1 200 OK</D:status>"));
+    let expected = chrono::DateTime::parse_from_rfc3339(ts)?
+        .with_timezone(&chrono::Utc)
+        .timestamp() as i64;
+    let actual = fs::metadata(server.path().join("test.html"))?
+        .created()?
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_secs() as i64;
+    assert!((actual - expected).abs() <= 2);
+    Ok(())
+}
+
+#[cfg(not(windows))]
+#[rstest]
+fn proppatch_file_set_creationdate_unsupported(
+    #[with(&["-A"])] server: TestServer,
+) -> Result<(), Error> {
+    let body = r#"<?xml version="1.0" encoding="utf-8"?>
+<D:propertyupdate xmlns:D="DAV:">
+<D:set><D:prop><D:creationdate>2026-03-06T01:02:03Z</D:creationdate></D:prop></D:set>
+</D:propertyupdate>"#;
+    let resp = fetch!(b"PROPPATCH", format!("{}test.html", server.url()))
+        .header("content-type", "application/xml; charset=utf-8")
+        .body(body.to_string())
+        .send()?;
+    assert_eq!(resp.status(), 207);
+    let body = resp.text()?;
+    assert!(body.contains("<D:creationdate/>"));
+    assert!(body.contains("<D:status>HTTP/1.1 403 Forbidden</D:status>"));
+    Ok(())
+}
+
+#[cfg(not(windows))]
+#[rstest]
+fn proppatch_file_set_creationdate_and_mtime_ignore_creation(
+    #[with(&["-A"])] server: TestServer,
+) -> Result<(), Error> {
+    let ts = "Fri, 06 Mar 2026 01:02:03 GMT";
+    let body = format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<D:propertyupdate xmlns:D="DAV:">
+<D:set>
+<D:prop>
+<D:creationdate>2026-03-06T01:02:03Z</D:creationdate>
+<D:getlastmodified>{ts}</D:getlastmodified>
+</D:prop>
+</D:set>
+</D:propertyupdate>"#
+    );
+    let resp = fetch!(b"PROPPATCH", format!("{}test.html", server.url()))
+        .header("content-type", "application/xml; charset=utf-8")
+        .body(body)
+        .send()?;
+    assert_eq!(resp.status(), 207);
+    let body = resp.text()?;
+    assert!(body.contains("<D:creationdate/>"));
+    assert!(body.contains("<D:getlastmodified/>"));
+    assert!(!body.contains("403 Forbidden"));
+    let expected = chrono::DateTime::parse_from_rfc2822(ts)?
+        .with_timezone(&chrono::Utc)
+        .timestamp() as u64;
+    let actual = fs::metadata(server.path().join("test.html"))?
+        .modified()?
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_secs();
+    assert_eq!(actual, expected);
     Ok(())
 }
 
